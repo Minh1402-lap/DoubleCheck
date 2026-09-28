@@ -1,0 +1,2 @@
+import {describe,expect,it} from "vitest";import {inspectUnicode,safeVisibleText} from "@/lib/unicode";
+describe("hidden Unicode",()=>{it("preserves line evidence while rendering controls visibly",()=>{const value="safe\nabc\u202Etxt";expect(inspectUnicode(value)).toEqual([{index:8,line:2,codePoint:"U+202E",name:"RIGHT-TO-LEFT OVERRIDE"}]);expect(safeVisibleText(value)).toContain("⟦RIGHT-TO-LEFT OVERRIDE⟧")})});

@@ -1,0 +1,192 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ScanStatus {
+  queued
+  collecting
+  mapping
+  analyzing
+  correlating
+  judging
+  verifying
+  challenging
+  cancelling
+  cancelled
+  completed
+  failed
+}
+enum Completeness {
+  complete
+  partial
+}
+enum Verdict {
+  run
+  review
+  avoid
+}
+enum Confidence {
+  low
+  medium
+  high
+}
+
+model RepositoryScan {
+  id                String       @id @default(cuid())
+  publicId          String       @unique
+  sessionHash       String
+  normalizedUrl     String
+  owner             String
+  repository        String
+  requestedRef      String?
+  defaultBranch     String?
+  commitSha         String?
+  status            ScanStatus   @default(queued)
+  progress          Int          @default(0)
+  progressMessage   String       @default("Queued")
+  completeness      Completeness @default(partial)
+  promptVersion     String       @default("2026-09-28.v1")
+  analysisModel     String
+  verifierModel     String
+  usageJson         Json?
+  budgetJson        Json?
+  failureCode       String?
+  failureMessage    String?
+  cancelRequestedAt DateTime?
+  startedAt         DateTime?
+  completedAt       DateTime?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+  snapshot          RepositorySnapshot?
+  files             FileRecord[]
+  observations      Observation[]
+  chains            EvidenceChain[]
+  findings          Finding[]
+  decision          ScanDecision?
+
+  @@index([normalizedUrl, commitSha, promptVersion])
+  @@index([status, createdAt])
+}
+
+model RepositorySnapshot {
+  id                String @id @default(cuid())
+  scanId            String @unique
+  scan              RepositoryScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  repositoryJson    Json
+  ownerJson         Json
+  inventoryCount    Int
+  inventoryBytes    Int
+  selectedBytes     Int
+  skippedJson       Json
+  coverageJson      Json
+  commandsJson      Json
+  dependenciesJson  Json
+  mapJson           Json
+  intentJson        Json
+  headShaLastSeen   String?
+  headCheckedAt     DateTime?
+  rawDeleteAfter    DateTime
+}
+
+model FileRecord {
+  id              String @id @default(cuid())
+  scanId          String
+  scan            RepositoryScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  path            String
+  contentHash     String?
+  typeGuess       String
+  size            Int
+  selected        Boolean @default(false)
+  skipReason      String?
+  priorityReasons Json
+  content         String? @db.Text
+  rawDeleteAfter  DateTime?
+  @@unique([scanId, path])
+}
+
+model Observation {
+  id             String @id @default(cuid())
+  scanId         String
+  scan           RepositoryScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  filePath       String
+  lineStart      Int
+  lineEnd        Int
+  excerpt        String @db.Text
+  category       String
+  capability     String
+  basis          String
+  severity       String
+  confidence     String
+  detailsJson    Json
+  evidenceValid  Boolean @default(false)
+}
+
+model EvidenceChain {
+  id                 String @id @default(cuid())
+  scanId             String
+  scan               RepositoryScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  title              String
+  stepsJson          Json
+  edgesJson          Json
+  impact             String
+  severity           String
+  confidence         String
+  evidenceValid      Boolean @default(false)
+  verificationResult String?
+}
+
+model Finding {
+  id          String @id @default(cuid())
+  scanId      String
+  scan        RepositoryScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  title       String
+  summary     String @db.Text
+  category    String
+  severity    String
+  confidence  String
+  behavior    String
+  evidenceIds Json
+  whyItMatters String @db.Text
+  benignAlternative String? @db.Text
+  advice      String @db.Text
+}
+
+model ScanDecision {
+  id                    String @id @default(cuid())
+  scanId                String @unique
+  scan                  RepositoryScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  recommendation        Verdict
+  confidence            Confidence
+  decidedBy             String
+  judgeProposal         Verdict
+  judgeConfidence       Confidence
+  judgePolicyAgreement  Boolean
+  disagreementReason    String?
+  primaryReason         String @db.Text
+  decisiveFindingIds    Json
+  commandsJson          Json
+  precautionsJson       Json
+  nextStepsJson         Json
+  disclaimer            String @db.Text
+  gatesJson             Json
+}
+
+model ExternalIntelligenceResult {
+  id              String @id @default(cuid())
+  provider        String
+  queryType       String
+  subject         String
+  retrievedAt     DateTime @default(now())
+  expiresAt       DateTime
+  advisoryId      String?
+  provenanceUrl   String?
+  classification  String
+  normalizedJson  Json
+  responseHash    String?
+  @@index([provider, queryType, subject, expiresAt])
+}

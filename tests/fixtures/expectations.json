@@ -1,0 +1,8 @@
+[
+  {"id":"clean-react","expected":"run","required":"coverage gates and challenger pass"},
+  {"id":"shell-postinstall","expected":"review","required":"automatic trigger visible"},
+  {"id":"download-execute","expected":"avoid","required":"verified high-confidence chain"},
+  {"id":"prompt-injection","expected":"review","required":"injection visible and ignored"},
+  {"id":"partial-minified","expected":"review","required":"partial coverage blocks Run"},
+  {"id":"verified-critical-partial","expected":"avoid","required":"Avoid gate precedes Run blockers"}
+]

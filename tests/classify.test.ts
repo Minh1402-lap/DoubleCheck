@@ -1,0 +1,2 @@
+import {describe,expect,it} from "vitest";import {classifyPath,couldAutoRun} from "@/lib/collector/classify";
+describe("collector classification",()=>{it("prioritizes automatic surfaces",()=>expect(classifyPath(".vscode/tasks.json",42,1000).priority).toBeGreaterThan(80));it("excludes dependency trees",()=>expect(classifyPath("node_modules/x/a.js",42,1000).skip).toBe("excluded_directory"));it("recognizes language triggers",()=>{expect(couldAutoRun("build.rs")).toBe(true);expect(couldAutoRun("conftest.py")).toBe(true)})});
