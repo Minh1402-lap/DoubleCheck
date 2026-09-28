@@ -8,6 +8,7 @@ import { computeDecision } from "../policy";
 import type { Chain, CoverageGate, NormalizedObservation } from "../types";
 import { STATIC_DISCLAIMER } from "../types";
 import { OpenAiProvider, type AiProvider } from "./provider";
+import { dailyBudgetStatus, scanUsageSummary } from "./usage";
 import { envelope, prompts } from "./prompts";
 import { challengeSchema, correlationSchema, fileAnalysisSchema, intentSchema, judgeSchema, mapSchema, verifierSchema } from "./schemas";
 
@@ -18,6 +19,14 @@ async function progress(id: string, status: "collecting"|"mapping"|"analyzing"|"
 function batch<T>(items: T[], size: number): T[][] { const out: T[][] = []; for (let i=0;i<items.length;i+=size) out.push(items.slice(i,i+size)); return out; }
 function json(value: unknown): Prisma.InputJsonValue { return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue; }
 
+export function scanFailureDetails(error: unknown) {
+  const message = error instanceof Error ? error.message : "";
+  if (message === "CANCELLED") return { status: "cancelled" as const, progressMessage: "Scan cancelled", failureCode: "CANCELLED", failureMessage: "CANCELLED", budgetExceeded: false };
+  if (message === "AI_DAILY_BUDGET_EXCEEDED") return { status: "failed" as const, progressMessage: "Daily AI budget reached", failureCode: "AI_DAILY_BUDGET_EXCEEDED", failureMessage: "The configured daily AI spending limit has been reached. Try again after 00:00 UTC.", budgetExceeded: true };
+  const safeMessage = /^(PRIVATE_REPOSITORY|AI_INVALID_|AI_PRICING_MISSING:)/.test(message) ? message : "The scan could not be completed. No repository code was executed.";
+  return { status: "failed" as const, progressMessage: "Scan failed safely", failureCode: "ANALYSIS_FAILED", failureMessage: safeMessage, budgetExceeded: false };
+}
+
 export async function processScan(scanId: string, provider?: AiProvider) {
   const scan = await db.repositoryScan.findUniqueOrThrow({ where: { id: scanId } });
   const cfg = env();
@@ -27,12 +36,14 @@ export async function processScan(scanId: string, provider?: AiProvider) {
     const collected = await new GitHubCollector().collect(scan.owner, scan.repository, scan.requestedRef ?? undefined);
     if ((await db.repositoryScan.findUniqueOrThrow({ where: { id: scanId } })).cancelRequestedAt) throw new Error("CANCELLED");
     const rawDeleteAfter = new Date(Date.now() + cfg.RAW_RETENTION_HOURS * 3_600_000);
+    const usage = await scanUsageSummary(scanId);
+    const budget = await dailyBudgetStatus(false);
     await db.$transaction([
       db.repositoryScan.update({ where: { id: scanId }, data: { defaultBranch: collected.defaultBranch, commitSha: collected.sha } }),
       db.repositorySnapshot.create({ data: { scanId, repositoryJson: collected.repository, ownerJson: collected.owner, inventoryCount: collected.coverage.inventoryCount, inventoryBytes: collected.coverage.inventoryBytes, selectedBytes: collected.coverage.selectedBytes, skippedJson: collected.files.filter((f) => !f.selected).map(({path,size,skipReason}) => ({path,size,skipReason})), coverageJson: collected.coverage, commandsJson: [], dependenciesJson: [], mapJson: {}, intentJson: [], rawDeleteAfter } }),
       ...collected.files.map((f) => db.fileRecord.create({ data: { scanId, path: f.path, contentHash: f.hash, typeGuess: f.type, size: f.size, selected: f.selected, skipReason: f.skipReason, priorityReasons: f.priorityReasons, content: f.content, rawDeleteAfter: f.content ? rawDeleteAfter : undefined } }))
     ]);
-    const ai = provider ?? new OpenAiProvider();
+    const ai = provider ?? new OpenAiProvider(scanId);
     const fileMap = new Map(collected.files.filter((f) => f.content !== undefined).map((f) => [f.path, f.content!]));
     const commands = [...fileMap].flatMap(([path, content]) => extractDocumentedCommands(path, content));
     await db.repositorySnapshot.update({ where: { scanId }, data: { commandsJson: json(commands) } });
@@ -79,10 +90,12 @@ export async function processScan(scanId: string, provider?: AiProvider) {
     await db.$transaction([
       ...chains.map((c) => db.evidenceChain.create({ data: { scanId, title: c.title, stepsJson: c.steps, edgesJson: c.edges, impact: correlated.chains.find((x) => x.id === c.id)?.impact ?? "", severity: c.severity, confidence: c.confidence, evidenceValid: c.evidenceValid, verificationResult: c.verifier } })),
       db.scanDecision.create({ data: { scanId, recommendation: decision.verdict, confidence: decision.confidence, decidedBy: decision.decidedBy, judgeProposal: judge.verdict, judgeConfidence: judge.confidence, judgePolicyAgreement: decision.judgePolicyAgreement, disagreementReason: decision.judgePolicyAgreement ? undefined : "The deterministic safety policy overrode the AI proposal.", primaryReason: decision.reason, decisiveFindingIds: json(judge.decisiveEvidenceIds), commandsJson: json(commands), precautionsJson: ["inspect_automatic_triggers", "use_disposable_environment"], nextStepsJson: json(judge.inspectNext), disclaimer: STATIC_DISCLAIMER, gatesJson: json({ decision, challenger, verifier: chains.map((c) => ({ id: c.id, result: c.verifier })) }) } }),
-      db.repositoryScan.update({ where: { id: scanId }, data: { status: "completed", progress: 100, progressMessage: "Analysis complete", completeness: partial ? "partial" : "complete", completedAt: new Date() } })
+      db.repositoryScan.update({ where: { id: scanId }, data: { status: "completed", progress: 100, progressMessage: "Analysis complete", completeness: partial ? "partial" : "complete", completedAt: new Date(), usageJson: json(usage), budgetJson: json(budget) } })
     ]);
   } catch (error) {
-    const cancelled = error instanceof Error && error.message === "CANCELLED";
-    await db.repositoryScan.update({ where: { id: scanId }, data: { status: cancelled ? "cancelled" : "failed", progressMessage: cancelled ? "Scan cancelled" : "Scan failed safely", failureCode: cancelled ? "CANCELLED" : "ANALYSIS_FAILED", failureMessage: error instanceof Error && /^(PRIVATE_REPOSITORY|AI_INVALID_|CANCELLED)/.test(error.message) ? error.message : "The scan could not be completed. No repository code was executed.", completedAt: new Date() } });
+    const failure = scanFailureDetails(error);
+    const usage = await scanUsageSummary(scanId);
+    const budget = await dailyBudgetStatus(failure.budgetExceeded);
+    await db.repositoryScan.update({ where: { id: scanId }, data: { status: failure.status, progressMessage: failure.progressMessage, failureCode: failure.failureCode, failureMessage: failure.failureMessage, usageJson: json(usage), budgetJson: json(budget), completedAt: new Date() } });
   }
 }

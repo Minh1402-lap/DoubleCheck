@@ -17,6 +17,8 @@ Collection uses repository metadata, a resolved immutable commit, a recursive tr
 
 The AI provider is a small structured-output interface. Prompts are versioned independently of UI copy. The mapper, file analyzer, correlator, intent analyzer, judge, verifier, and challenger receive different contracts. Repository text is enclosed as untrusted data and cannot choose tools or destinations.
 
+Before each provider request, the worker atomically reserves a conservative maximum cost against a PostgreSQL UTC-day ledger. Completed responses reconcile that reservation using provider-reported input, cached-input, and output tokens plus operator-configured model prices. Per-stage usage is retained with the scan; ambiguous failures are charged at the reserved estimate so concurrent or failing workers cannot bypass the daily ceiling.
+
 Evidence validation and policy are deterministic. Unsupported excerpts are dropped. The Avoid gate executes first; coverage limitations cannot dilute a verified critical chain. The Run gate then requires complete applicable coverage, no unresolved material findings, no prompt injection, zero unclassified auto-run surfaces, judge agreement, and a passing independent challenge.
 
 The anonymous session secret is stored only as an HttpOnly cookie; the database receives an HMAC. Report public IDs use 24 random URL-safe characters. Every read and write checks session ownership.

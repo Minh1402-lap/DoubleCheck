@@ -36,11 +36,14 @@ Open `http://localhost:3000`. `/demo` is a sanitized, explicitly labeled report 
 | `APP_BASE_URL` | Canonical application origin |
 | `SESSION_SECRET` | At least 32 characters; hashes anonymous ownership sessions |
 | `DEMO_MODE` | Must be explicitly `true` or `false`; does not affect the live path |
-| `MAX_DAILY_AI_USD` | Configured cost ceiling |
+| `MAX_DAILY_AI_USD` | Global UTC-day AI cost ceiling, enforced before every provider call |
+| `AI_MODEL_PRICING_JSON` | Model-ID map of current USD-per-million `input`, `cachedInput`, and `output` token prices |
 | `RAW_RETENTION_HOURS` | Raw content retention, default 24 |
 | `REPORT_RETENTION_DAYS` | Redacted report retention, default 30 |
 
 Model IDs have no silent default. Invalid or absent configuration fails clearly.
+Keep `AI_MODEL_PRICING_JSON` synchronized with provider prices. Each request reserves a conservative maximum cost before it is sent and is reconciled from the Responses API token counts afterward. A request that fails after dispatch retains its reservation as estimated spend because it may still have been billed.
+Each scan persists aggregate and per-stage token/cost data in `usageJson`. Its `budgetJson` records the UTC date, cap, spent, reserved, and remaining microdollars, plus whether the scan was blocked by the cap.
 
 ## Commands
 

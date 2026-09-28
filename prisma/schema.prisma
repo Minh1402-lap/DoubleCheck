@@ -68,9 +68,41 @@ model RepositoryScan {
   chains            EvidenceChain[]
   findings          Finding[]
   decision          ScanDecision?
+  aiUsage           AiUsage[]
 
   @@index([normalizedUrl, commitSha, promptVersion])
   @@index([status, createdAt])
+}
+
+model AiDailyBudget {
+  day               DateTime @id @db.Date
+  spentMicrousd     BigInt   @default(0)
+  reservedMicrousd  BigInt   @default(0)
+  updatedAt         DateTime @updatedAt
+}
+
+model AiUsage {
+  id                       String   @id @default(cuid())
+  scanId                   String
+  scan                     RepositoryScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  day                      DateTime @db.Date
+  stage                    String
+  model                    String
+  status                   String
+  inputTokens              Int?
+  cachedInputTokens        Int?
+  outputTokens             Int?
+  reasoningTokens          Int?
+  totalTokens              Int?
+  reservedMicrousd         BigInt
+  actualMicrousd           BigInt?
+  providerResponseId       String?
+  providerRequestId        String?
+  createdAt                DateTime @default(now())
+  completedAt              DateTime?
+
+  @@index([scanId, createdAt])
+  @@index([day, status])
 }
 
 model RepositorySnapshot {
