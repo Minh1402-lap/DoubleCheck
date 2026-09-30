@@ -1,7 +1,7 @@
 import { db } from "../db";
 import type { Prisma } from "@prisma/client";
 import { env } from "../env";
-import { GitHubCollector } from "../collector/github";
+import { GitHubApiError } from "../collector/github";
 import { extractDocumentedCommands } from "../commands";
 import { verifyEvidence } from "../evidence";
 import { computeDecision } from "../policy";
@@ -23,6 +23,22 @@ export function scanFailureDetails(error: unknown) {
   const message = error instanceof Error ? error.message : "";
   if (message === "CANCELLED") return { status: "cancelled" as const, progressMessage: "Scan cancelled", failureCode: "CANCELLED", failureMessage: "CANCELLED", budgetExceeded: false };
   if (message === "AI_DAILY_BUDGET_EXCEEDED") return { status: "failed" as const, progressMessage: "Daily AI budget reached", failureCode: "AI_DAILY_BUDGET_EXCEEDED", failureMessage: "The configured daily AI spending limit has been reached. Try again after 00:00 UTC.", budgetExceeded: true };
+  if (message === "AI_SCAN_BUDGET_EXCEEDED") return { status: "failed" as const, progressMessage: "Per-scan AI budget reached", failureCode: "AI_SCAN_BUDGET_EXCEEDED", failureMessage: "Optional AI analysis stopped before exceeding the configured per-scan cost limit.", budgetExceeded: true };
+  const providerStatus=typeof error==="object"&&error!==null&&"status" in error&&typeof error.status==="number"?error.status:undefined;
+  if(providerStatus){const detail=message.replace(/sk-[A-Za-z0-9_-]+/g,"[redacted]").slice(0,400);return {status:"failed" as const,progressMessage:"AI provider request failed",failureCode:"AI_PROVIDER_ERROR",failureMessage:`The AI provider rejected the request (HTTP ${providerStatus}). ${detail}`,budgetExceeded:false};}
+  if (error instanceof GitHubApiError) {
+    const progressMessage: Record<string, string> = {
+      GITHUB_TOKEN_MISSING: "GitHub token is not configured",
+      GITHUB_TOKEN_INVALID: "GitHub authentication failed",
+      GITHUB_PERMISSION_DENIED: "GitHub access denied",
+      GITHUB_PRIMARY_RATE_LIMIT: "GitHub API rate limit reached",
+      GITHUB_SECONDARY_RATE_LIMIT: "GitHub API temporarily throttled",
+      GITHUB_REPOSITORY_NOT_FOUND: "Repository not found",
+      GITHUB_PRIVATE_REPOSITORY: "Private repository not supported",
+      GITHUB_API_ERROR: "GitHub API request failed"
+    };
+    return { status: "failed" as const, progressMessage: progressMessage[error.code], failureCode: error.code, failureMessage: error.message, budgetExceeded: false };
+  }
   const safeMessage = /^(PRIVATE_REPOSITORY|AI_INVALID_|AI_PRICING_MISSING:)/.test(message) ? message : "The scan could not be completed. No repository code was executed.";
   return { status: "failed" as const, progressMessage: "Scan failed safely", failureCode: "ANALYSIS_FAILED", failureMessage: safeMessage, budgetExceeded: false };
 }
@@ -31,20 +47,14 @@ export async function processScan(scanId: string, provider?: AiProvider) {
   const scan = await db.repositoryScan.findUniqueOrThrow({ where: { id: scanId } });
   const cfg = env();
   try {
-    await db.repositoryScan.update({ where: { id: scanId }, data: { startedAt: new Date() } });
-    await progress(scanId, "collecting", 8, "Collecting immutable repository snapshot");
-    const collected = await new GitHubCollector().collect(scan.owner, scan.repository, scan.requestedRef ?? undefined);
+    if (!scan.staticReportJson || !scan.commitSha) throw new Error("STATIC_REPORT_REQUIRED");
+    await db.repositoryScan.update({ where: { id: scanId }, data: { status:"ai_analyzing", progress: 5, progressMessage:"Optional AI analysis started", aiFailureCode:null, aiFailureMessage:null } });
+    const records=await db.fileRecord.findMany({where:{scanId}}); const snap=await db.repositorySnapshot.findUniqueOrThrow({where:{scanId}});
+    type AiCollected={defaultBranch:string|null;sha:string;repository:unknown;owner:unknown;coverage:{inventoryCount:number;inventoryBytes:number;selectedBytes:number;inventoryTruncated:boolean};unclassified:string[];files:Array<{path:string;size:number;type:string;selected:boolean;priorityReasons:string[];skipReason:string|null;content:string|null;hash:string|null}>};
+    const collected:AiCollected={defaultBranch:scan.defaultBranch,sha:scan.commitSha,repository:snap.repositoryJson,owner:snap.ownerJson,coverage:snap.coverageJson as AiCollected["coverage"],unclassified:[],files:records.map(f=>({path:f.path,size:f.size,type:f.typeGuess,selected:f.selected,priorityReasons:Array.isArray(f.priorityReasons)?f.priorityReasons.filter((x):x is string=>typeof x==="string"):[],skipReason:f.skipReason,content:f.content,hash:f.contentHash}))};
     if ((await db.repositoryScan.findUniqueOrThrow({ where: { id: scanId } })).cancelRequestedAt) throw new Error("CANCELLED");
-    const rawDeleteAfter = new Date(Date.now() + cfg.RAW_RETENTION_HOURS * 3_600_000);
-    const usage = await scanUsageSummary(scanId);
-    const budget = await dailyBudgetStatus(false);
-    await db.$transaction([
-      db.repositoryScan.update({ where: { id: scanId }, data: { defaultBranch: collected.defaultBranch, commitSha: collected.sha } }),
-      db.repositorySnapshot.create({ data: { scanId, repositoryJson: collected.repository, ownerJson: collected.owner, inventoryCount: collected.coverage.inventoryCount, inventoryBytes: collected.coverage.inventoryBytes, selectedBytes: collected.coverage.selectedBytes, skippedJson: collected.files.filter((f) => !f.selected).map(({path,size,skipReason}) => ({path,size,skipReason})), coverageJson: collected.coverage, commandsJson: [], dependenciesJson: [], mapJson: {}, intentJson: [], rawDeleteAfter } }),
-      ...collected.files.map((f) => db.fileRecord.create({ data: { scanId, path: f.path, contentHash: f.hash, typeGuess: f.type, size: f.size, selected: f.selected, skipReason: f.skipReason, priorityReasons: f.priorityReasons, content: f.content, rawDeleteAfter: f.content ? rawDeleteAfter : undefined } }))
-    ]);
     const ai = provider ?? new OpenAiProvider(scanId);
-    const fileMap = new Map(collected.files.filter((f) => f.content !== undefined).map((f) => [f.path, f.content!]));
+    const fileMap = new Map<string,string>(collected.files.filter((f) => typeof f.content === "string").map((f) => [f.path, f.content as string]));
     const commands = [...fileMap].flatMap(([path, content]) => extractDocumentedCommands(path, content));
     await db.repositorySnapshot.update({ where: { scanId }, data: { commandsJson: json(commands) } });
 
@@ -87,15 +97,18 @@ export async function processScan(scanId: string, provider?: AiProvider) {
       challenger = challenge.result;
     }
     const decision = computeDecision({ chains, observations: validObservations, coverage, challenger, judge, promptInjectionFound: validObservations.some((o) => o.category === "prompt_injection_attempt"), trustSignalCount: 0, pressureAndNewOwner: false });
+    const usage = await scanUsageSummary(scanId);const budget = await dailyBudgetStatus(false);
+    const aiReport=json({version:1,models:{analysis:cfg.AI_ANALYSIS_MODEL,verifier:cfg.AI_VERIFIER_MODEL},map,observations:validObservations,chains,decision,judge,usage});
     await db.$transaction([
       ...chains.map((c) => db.evidenceChain.create({ data: { scanId, title: c.title, stepsJson: c.steps, edgesJson: c.edges, impact: correlated.chains.find((x) => x.id === c.id)?.impact ?? "", severity: c.severity, confidence: c.confidence, evidenceValid: c.evidenceValid, verificationResult: c.verifier } })),
       db.scanDecision.create({ data: { scanId, recommendation: decision.verdict, confidence: decision.confidence, decidedBy: decision.decidedBy, judgeProposal: judge.verdict, judgeConfidence: judge.confidence, judgePolicyAgreement: decision.judgePolicyAgreement, disagreementReason: decision.judgePolicyAgreement ? undefined : "The deterministic safety policy overrode the AI proposal.", primaryReason: decision.reason, decisiveFindingIds: json(judge.decisiveEvidenceIds), commandsJson: json(commands), precautionsJson: ["inspect_automatic_triggers", "use_disposable_environment"], nextStepsJson: json(judge.inspectNext), disclaimer: STATIC_DISCLAIMER, gatesJson: json({ decision, challenger, verifier: chains.map((c) => ({ id: c.id, result: c.verifier })) }) } }),
-      db.repositoryScan.update({ where: { id: scanId }, data: { status: "completed", progress: 100, progressMessage: "Analysis complete", completeness: partial ? "partial" : "complete", completedAt: new Date(), usageJson: json(usage), budgetJson: json(budget) } })
+      db.repositoryScan.update({ where: { id: scanId }, data: { status: "completed", progress: 100, progressMessage: "Optional AI analysis complete", completeness: partial ? "partial" : "complete", completedAt: new Date(), aiCompletedAt:new Date(), aiReportJson:aiReport, usageJson: json(usage), budgetJson: json(budget) } })
     ]);
   } catch (error) {
     const failure = scanFailureDetails(error);
+    console.error(`[worker] Scan ${scan.publicId} failed: ${failure.failureCode}`);
     const usage = await scanUsageSummary(scanId);
     const budget = await dailyBudgetStatus(failure.budgetExceeded);
-    await db.repositoryScan.update({ where: { id: scanId }, data: { status: failure.status, progressMessage: failure.progressMessage, failureCode: failure.failureCode, failureMessage: failure.failureMessage, usageJson: json(usage), budgetJson: json(budget), completedAt: new Date() } });
+    await db.repositoryScan.update({ where: { id: scanId }, data: { status: scan.staticReportJson?"static_complete":failure.status, progress:100, progressMessage: scan.staticReportJson?"Static report ready; optional AI failed":failure.progressMessage, aiFailureCode:failure.failureCode, aiFailureMessage:failure.failureMessage, usageJson: json(usage), budgetJson: json(budget), aiCompletedAt:new Date() } });
   }
 }

@@ -1,24 +1,24 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({ executeRaw: vi.fn(), create: vi.fn() }));
+const mocks = vi.hoisted(() => ({ executeRaw: vi.fn(), create: vi.fn(), findMany: vi.fn() }));
 
 vi.mock("../src/lib/env", () => ({
-  env: () => ({ MAX_DAILY_AI_USD: 0.05, AI_MODEL_PRICING_JSON: { "test-model": { input: 1, cachedInput: 0.1, output: 1 } } })
+  env: () => ({ AI_DAILY_BUDGET_USD: 0.05, AI_MAX_COST_PER_SCAN_USD: 0.25, AI_MODEL_PRICING_JSON: { "test-model": { input: 1, cachedInput: 0.1, output: 1 }, "gpt-5.6-terra": { input: 2, cachedInput: 0.2, output: 12 } } })
 }));
 
 vi.mock("../src/lib/db", () => ({
   db: {
-    $transaction: vi.fn(async (callback: (tx: unknown) => unknown) => callback({ $executeRaw: mocks.executeRaw, aiUsage: { create: mocks.create } }))
+    $transaction: vi.fn(async (callback: (tx: unknown) => unknown) => callback({ $executeRaw: mocks.executeRaw, aiUsage: { create: mocks.create, findMany: mocks.findMany } }))
   }
 }));
 
-import { reserveAiUsage } from "../src/lib/analysis/usage";
+import { calculateEstimatedCostMicrousd, modelPricing, reserveAiUsage } from "../src/lib/analysis/usage";
 
 describe("AI daily budget reservations", () => {
   beforeEach(() => vi.clearAllMocks());
 
   it("allows and records a request below the budget", async () => {
-    mocks.executeRaw.mockResolvedValueOnce(0).mockResolvedValueOnce(1);
+    mocks.findMany.mockResolvedValue([]); mocks.executeRaw.mockResolvedValueOnce(0).mockResolvedValueOnce(1);
     const reservation = await reserveAiUsage({ scanId: "scan-1", stage: "map", model: "test-model", system: "system", data: "data" });
     expect(reservation.reserved).toBeGreaterThan(0n);
     expect(mocks.create).toHaveBeenCalledOnce();
@@ -26,8 +26,26 @@ describe("AI daily budget reservations", () => {
   });
 
   it("rejects a request at the budget limit without recording it", async () => {
-    mocks.executeRaw.mockResolvedValueOnce(0).mockResolvedValueOnce(0);
+    mocks.findMany.mockResolvedValue([]); mocks.executeRaw.mockResolvedValueOnce(0).mockResolvedValueOnce(0);
     await expect(reserveAiUsage({ scanId: "scan-2", stage: "judge", model: "test-model", system: "system", data: "data" })).rejects.toThrow("AI_DAILY_BUDGET_EXCEEDED");
     expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects a request that would exceed the per-scan cap", async () => {
+    mocks.findMany.mockResolvedValue([{ status: "completed", reservedMicrousd: 245_000n, actualMicrousd: 245_000n }]);
+    await expect(reserveAiUsage({ scanId: "scan-3", stage: "file", model: "test-model", system: "system", data: "data" })).rejects.toThrow("AI_SCAN_BUDGET_EXCEEDED");
+    expect(mocks.executeRaw).not.toHaveBeenCalled(); expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it("resolves Terra pricing with USD-per-million units", () => {
+    expect(modelPricing("gpt-5.6-terra")).toEqual({ input: 2, cachedInput: 0.2, output: 12 });
+  });
+
+  it("rejects an unknown model", () => {
+    expect(() => modelPricing("unknown-model")).toThrow("AI_PRICING_MISSING:unknown-model");
+  });
+
+  it("calculates the conservative Terra reservation", () => {
+    expect(calculateEstimatedCostMicrousd(modelPricing("gpt-5.6-terra"), "system", "data")).toBe(98_068n);
   });
 });

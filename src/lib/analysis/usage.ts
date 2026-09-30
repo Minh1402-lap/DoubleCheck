@@ -9,7 +9,7 @@ const INPUT_TOKEN_OVERHEAD = 1024;
 export type AiModelPricing = { input: number; cachedInput: number; output: number };
 
 export class AiBudgetExceededError extends Error {
-  constructor() { super("AI_DAILY_BUDGET_EXCEEDED"); }
+  constructor(code:"AI_DAILY_BUDGET_EXCEEDED"|"AI_SCAN_BUDGET_EXCEEDED"="AI_DAILY_BUDGET_EXCEEDED") { super(code); }
 }
 
 function utcDay(now = new Date()) {
@@ -17,10 +17,11 @@ function utcDay(now = new Date()) {
 }
 
 function capMicrousd() {
-  return BigInt(Math.floor(env().MAX_DAILY_AI_USD * 1_000_000));
+  return BigInt(Math.floor(env().AI_DAILY_BUDGET_USD * 1_000_000));
 }
+function scanCapMicrousd(){return BigInt(Math.floor(env().AI_MAX_COST_PER_SCAN_USD*1_000_000));}
 
-function prices(model: string) {
+export function modelPricing(model: string): AiModelPricing {
   const value = env().AI_MODEL_PRICING_JSON[model];
   if (!value) throw new Error(`AI_PRICING_MISSING:${model}`);
   return value;
@@ -42,21 +43,24 @@ export function calculateActualCostMicrousd(price: AiModelPricing, usage: Respon
 
 export async function reserveAiUsage(input: { scanId: string; stage: string; model: string; system: string; data: string }) {
   const day = utcDay();
-  const reserved = calculateEstimatedCostMicrousd(prices(input.model), input.system, input.data);
+  const reserved = calculateEstimatedCostMicrousd(modelPricing(input.model), input.system, input.data);
   const id = randomUUID();
   const acquired = await db.$transaction(async (tx) => {
+    const scanRows=await tx.aiUsage.findMany({where:{scanId:input.scanId},select:{status:true,reservedMicrousd:true,actualMicrousd:true}});
+    const scanCommitted=scanRows.reduce((sum,row)=>sum+(row.status==="reserved"?row.reservedMicrousd:(row.actualMicrousd??0n)),0n);
+    if(scanCommitted+reserved>scanCapMicrousd())return "scan" as const;
     await tx.$executeRaw`INSERT INTO "AiDailyBudget" ("day", "spentMicrousd", "reservedMicrousd", "updatedAt") VALUES (${day}, 0, 0, NOW()) ON CONFLICT ("day") DO NOTHING`;
     const changed = await tx.$executeRaw`UPDATE "AiDailyBudget" SET "reservedMicrousd" = "reservedMicrousd" + ${reserved}, "updatedAt" = NOW() WHERE "day" = ${day} AND "spentMicrousd" + "reservedMicrousd" + ${reserved} <= ${capMicrousd()}`;
-    if (changed !== 1) return false;
+    if (changed !== 1) return "daily" as const;
     await tx.aiUsage.create({ data: { id, scanId: input.scanId, day, stage: input.stage, model: input.model, status: "reserved", reservedMicrousd: reserved } });
-    return true;
+    return "ok" as const;
   });
-  if (!acquired) throw new AiBudgetExceededError();
+  if (acquired!=="ok") throw new AiBudgetExceededError(acquired==="scan"?"AI_SCAN_BUDGET_EXCEEDED":"AI_DAILY_BUDGET_EXCEEDED");
   return { id, day, reserved, model: input.model };
 }
 
 export async function completeAiUsage(reservation: Awaited<ReturnType<typeof reserveAiUsage>>, usage: ResponseUsage, responseId?: string, requestId?: string) {
-  const actual = calculateActualCostMicrousd(prices(reservation.model), usage);
+  const actual = calculateActualCostMicrousd(modelPricing(reservation.model), usage);
   await db.$transaction([
     db.aiDailyBudget.update({ where: { day: reservation.day }, data: { reservedMicrousd: { decrement: reservation.reserved }, spentMicrousd: { increment: actual } } }),
     db.aiUsage.update({ where: { id: reservation.id }, data: { status: "completed", inputTokens: usage.input_tokens, cachedInputTokens: usage.input_tokens_details.cached_tokens, outputTokens: usage.output_tokens, reasoningTokens: usage.output_tokens_details.reasoning_tokens, totalTokens: usage.total_tokens, actualMicrousd: actual, providerResponseId: responseId, providerRequestId: requestId, completedAt: new Date() } })

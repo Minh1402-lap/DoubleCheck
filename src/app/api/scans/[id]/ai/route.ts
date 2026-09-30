@@ -1,0 +1,14 @@
+import {NextRequest,NextResponse} from "next/server";
+import {Prisma} from "@prisma/client";
+import {db} from "@/lib/db";import {env} from "@/lib/env";import {sessionIdentity} from "@/lib/session";import {aiFeatureAvailability} from "@/lib/ai-feature";
+const out=(code:string,message:string,status:number,details?:unknown)=>NextResponse.json({error:{code,message,details}},{status});
+export async function POST(req:NextRequest,{params}:{params:Promise<{id:string}>}){try{
+ if(req.headers.get("origin")&&req.headers.get("origin")!==req.nextUrl.origin)return out("CROSS_ORIGIN","Cross-origin request blocked.",403);
+ const cfg=env(),availability=aiFeatureAvailability(cfg.AI_FEATURE_MODE,process.env.NODE_ENV);if(!availability.allowed)return out(availability.code,availability.message,availability.status);
+ if(!cfg.OPENAI_API_KEY||!cfg.AI_ANALYSIS_MODEL||!cfg.AI_VERIFIER_MODEL)return out("AI_CONFIG_MISSING","AI provider configuration is incomplete.",503);
+ const {id}=await params,s=await sessionIdentity();const scan=await db.repositoryScan.findFirst({where:{publicId:id,sessionHash:s.hash}});if(!scan)return out("SCAN_NOT_FOUND","Scan not found.",404);
+ if(!scan.staticReportJson)return out("STATIC_REPORT_REQUIRED","Static analysis must complete first.",409);if(["ai_queued","ai_analyzing"].includes(scan.status))return out("AI_ALREADY_RUNNING","AI analysis is already queued or running.",409);if(scan.status==="completed"&&scan.aiCompletedAt)return NextResponse.json({status:"completed",reused:true});
+ const cached=await db.repositoryScan.findFirst({where:{id:{not:scan.id},normalizedUrl:scan.normalizedUrl,commitSha:scan.commitSha,promptVersion:scan.promptVersion,analysisModel:scan.analysisModel,verifierModel:scan.verifierModel,status:"completed",aiReportJson:{not:Prisma.JsonNull}},orderBy:{aiCompletedAt:"desc"}});
+ if(cached?.aiReportJson){await db.repositoryScan.update({where:{id:scan.id},data:{status:"completed",progress:100,progressMessage:"Optional AI analysis complete (cached)",aiReportJson:cached.aiReportJson,aiCompletedAt:new Date()}});return NextResponse.json({status:"completed",reused:true});}
+ await db.repositoryScan.update({where:{id:scan.id},data:{status:"ai_queued",progress:0,progressMessage:"Optional AI analysis queued",aiRequestedAt:new Date(),aiFailureCode:null,aiFailureMessage:null}});return NextResponse.json({status:"ai_queued",estimatedMaxCostUsd:cfg.AI_MAX_COST_PER_SCAN_USD},{status:202});
+ }catch{return out("INTERNAL_ERROR","Unable to queue optional AI analysis.",500);}}

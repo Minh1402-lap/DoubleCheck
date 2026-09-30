@@ -1,4 +1,5 @@
 import { db } from "./lib/db";
+import { processStaticScan } from "./lib/static-pipeline";
 import { processScan } from "./lib/analysis/pipeline";
 import { env } from "./lib/env";
 
@@ -11,13 +12,13 @@ async function cleanupExpiredData() {
   const cfg = env();
   const completedBefore = new Date(now - cfg.REPORT_RETENTION_DAYS * 86_400_000);
   await db.fileRecord.updateMany({ where: { content: { not: null }, rawDeleteAfter: { lte: new Date(now) } }, data: { content: null } });
-  await db.repositoryScan.deleteMany({ where: { status: { in: ["completed", "failed", "cancelled"] }, completedAt: { lte: completedBefore } } });
+  await db.repositoryScan.deleteMany({ where: { status: { in: ["static_complete", "completed", "failed", "cancelled"] }, completedAt: { lte: completedBefore } } });
 }
 
 async function tick() {
   await cleanupExpiredData();
-  const job = await db.repositoryScan.findFirst({ where: { status: "queued" }, orderBy: { createdAt: "asc" } });
-  if (job) await processScan(job.id);
+  const job = await db.repositoryScan.findFirst({ where: { status: { in:["queued","ai_queued"] } }, orderBy: { updatedAt: "asc" } });
+  if (job) { if (job.status==="queued") await processStaticScan(job.id); else await processScan(job.id); }
 }
 
 async function main() {

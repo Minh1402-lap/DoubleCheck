@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { aggregateAiUsage, calculateActualCostMicrousd, calculateEstimatedCostMicrousd } from "../src/lib/analysis/usage";
 import { scanFailureDetails } from "../src/lib/analysis/pipeline";
+import { GitHubApiError } from "../src/lib/collector/github";
 
 describe("AI usage costing", () => {
   const pricing = { input: 2.5, cachedInput: 1.25, output: 10 };
@@ -36,6 +37,20 @@ describe("AI usage costing", () => {
       failureCode: "AI_DAILY_BUDGET_EXCEEDED",
       failureMessage: "The configured daily AI spending limit has been reached. Try again after 00:00 UTC.",
       budgetExceeded: true
+    });
+  });
+});
+
+describe("GitHub collection failures", () => {
+  it("keeps a primary GitHub rate-limit reset time actionable and safe", () => {
+    const error = new GitHubApiError("GITHUB_PRIMARY_RATE_LIMIT", "GitHub's primary API rate limit has been reached. The limit resets at 2026-09-30T12:00:00.000Z.", { resetAt: "2026-09-30T12:00:00.000Z" });
+
+    expect(scanFailureDetails(error)).toEqual({
+      status: "failed",
+      progressMessage: "GitHub API rate limit reached",
+      failureCode: "GITHUB_PRIMARY_RATE_LIMIT",
+      failureMessage: "GitHub's primary API rate limit has been reached. The limit resets at 2026-09-30T12:00:00.000Z.",
+      budgetExceeded: false
     });
   });
 });

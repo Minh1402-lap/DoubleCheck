@@ -1,24 +1,19 @@
-# Architecture
+# Static-first architecture
 
 ```text
-browser -> Next.js intake/API -> PostgreSQL queue -> worker
-                                             |
-                                             +-> fixed-origin GitHub collector
-                                             +-> mapper -> file analyzer -> correlator
-                                             +-> intent comparison -> judge proposal
-                                             +-> Avoid verifier / Run challenger
-                                             +-> deterministic two-gate policy
-                                             +-> private report + sanitized export
+browser -> Next.js API -> PostgreSQL queue -> worker -> fixed-origin GitHub collector
+                                                   -> deterministic static rules
+                                                   -> static_complete report
+
+static_complete -> explicit POST /api/scans/:id/ai -> AI queue (optional)
+                                                    -> cost reservations
+                                                    -> completed AI supplement
 ```
 
-The database is the durable job boundary. Web requests only validate, authorize, rate-limit, and enqueue scans. A separately runnable worker claims queued work and persists every meaningful status, including `verifying`, `challenging`, `cancelling`, and `cancelled`.
+The static lifecycle is independent of AI configuration, provider availability, and billing. A scan resolves an immutable Git commit, stores bounded text blobs as untrusted data, runs versioned deterministic rules, and persists `staticReportJson`. Repository files are never executed. Static cache reuse requires normalized repository identity, commit SHA, and ruleset version; a cached public-repository result is copied into the requesting session's record rather than exposing another session.
 
-Collection uses repository metadata, a resolved immutable commit, a recursive tree, and individual blob reads. Inventory, file, selected-byte, and total-byte limits are enforced before model input. No archive extraction exists, which removes zip-slip, symlink, device-file, and decompression-bomb exposure from this version.
+Optional AI begins only through the explicit, same-origin `POST /api/scans/:id/ai` route after static completion. `disabled` is the default. `local` is accepted only under `NODE_ENV=development`. `server` is rejected until real application authentication exists. Duplicate running requests return a conflict, and completed results may be reused only for the same repository commit, prompt version, analysis model, and verifier model. AI failure returns the scan to `static_complete` and stores separate AI error fields, preserving the static report.
 
-The AI provider is a small structured-output interface. Prompts are versioned independently of UI copy. The mapper, file analyzer, correlator, intent analyzer, judge, verifier, and challenger receive different contracts. Repository text is enclosed as untrusted data and cannot choose tools or destinations.
+Before every provider request, PostgreSQL atomically checks both a per-scan ceiling and a UTC-day ceiling, then reserves a conservative maximum. Provider-reported token usage reconciles successful reservations; ambiguous dispatched failures are charged at the reservation. API keys remain server-side.
 
-Before each provider request, the worker atomically reserves a conservative maximum cost against a PostgreSQL UTC-day ledger. Completed responses reconcile that reservation using provider-reported input, cached-input, and output tokens plus operator-configured model prices. Per-stage usage is retained with the scan; ambiguous failures are charged at the reserved estimate so concurrent or failing workers cannot bypass the daily ceiling.
-
-Evidence validation and policy are deterministic. Unsupported excerpts are dropped. The Avoid gate executes first; coverage limitations cannot dilute a verified critical chain. The Run gate then requires complete applicable coverage, no unresolved material findings, no prompt injection, zero unclassified auto-run surfaces, judge agreement, and a passing independent challenge.
-
-The anonymous session secret is stored only as an HttpOnly cookie; the database receives an HMAC. Report public IDs use 24 random URL-safe characters. Every read and write checks session ownership.
+The anonymous session secret is stored only as an HttpOnly cookie; the database receives an HMAC. Every status, report, export, delete, and AI request verifies session ownership. Public repository content may be reused by copying sanitized output, never by granting access to another scan record.

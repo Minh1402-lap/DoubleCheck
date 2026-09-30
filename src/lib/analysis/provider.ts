@@ -20,7 +20,6 @@ export class OpenAiProvider implements AiProvider {
     try {
       response = await this.client.responses.parse({
         model,
-        temperature: 0,
         max_output_tokens: 8000,
         input: [{ role: "system", content: system }, { role: "user", content: data }],
         text: { format: zodTextFormat(schema, `doublecheck_${stage.replace(/[^A-Za-z0-9_]/g, "_")}`) }

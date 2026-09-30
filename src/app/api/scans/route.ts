@@ -1,20 +1,7 @@
-import { NextRequest, NextResponse } from "next/server";
-import { nanoid } from "nanoid";
-import { z } from "zod";
-import { db } from "@/lib/db";
-import { env } from "@/lib/env";
-import { normalizeGitHubUrl } from "@/lib/github-url";
-import { rateLimit } from "@/lib/rate-limit";
-import { sessionIdentity, setSessionCookie } from "@/lib/session";
-
-export async function POST(request: NextRequest) {
-  if (!request.headers.get("content-type")?.startsWith("application/json")) return NextResponse.json({error:"Expected JSON."},{status:415});
-  const origin=request.headers.get("origin"); if(origin && origin!==request.nextUrl.origin) return NextResponse.json({error:"Cross-origin request blocked."},{status:403});
-  const identity=await sessionIdentity(); const ip=request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()??"local";
-  if(!rateLimit(`${ip}:${identity.hash}`)) return NextResponse.json({error:"Scan limit reached. Try again later."},{status:429});
-  try {
-    const body=z.object({url:z.string().max(500)}).parse(await request.json()); const repo=normalizeGitHubUrl(body.url); const cfg=env();
-    const scan=await db.repositoryScan.create({data:{publicId:nanoid(24),sessionHash:identity.hash,normalizedUrl:repo.normalizedUrl,owner:repo.owner,repository:repo.repository,requestedRef:repo.requestedRef,analysisModel:cfg.AI_ANALYSIS_MODEL,verifierModel:cfg.AI_VERIFIER_MODEL}});
-    const response=NextResponse.json({id:scan.publicId},{status:202}); if(identity.isNew) response.headers.set("Set-Cookie",setSessionCookie(identity.raw)); return response;
-  } catch(error) { return NextResponse.json({error:error instanceof Error?error.message:"Invalid request."},{status:400}); }
-}
+import {NextRequest,NextResponse} from "next/server";import {nanoid} from "nanoid";import {z} from "zod";import {db} from "@/lib/db";import {env} from "@/lib/env";import {normalizeGitHubUrl} from "@/lib/github-url";import {rateLimit} from "@/lib/rate-limit";import {sessionIdentity,setSessionCookie} from "@/lib/session";
+const failure=(code:string,message:string,status:number,details?:unknown)=>NextResponse.json({error:{code,message,details}},{status});
+export async function POST(request:NextRequest){try{
+ if(!request.headers.get("content-type")?.startsWith("application/json"))return failure("UNSUPPORTED_MEDIA_TYPE","Expected JSON.",415);const origin=request.headers.get("origin");if(origin&&origin!==request.nextUrl.origin)return failure("CROSS_ORIGIN","Cross-origin request blocked.",403);
+ let repo:ReturnType<typeof normalizeGitHubUrl>;try{const body=z.object({url:z.string().max(500)}).parse(await request.json());repo=normalizeGitHubUrl(body.url)}catch(error){const message=error instanceof z.ZodError?"Enter a valid GitHub repository URL.":error instanceof SyntaxError?"The request body must be valid JSON.":error instanceof Error?error.message:"Invalid request.";return failure("INVALID_REPOSITORY_URL",message,400)}
+ const identity=await sessionIdentity(),ip=request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()??"local";if(!rateLimit(`${ip}:${identity.hash}`))return failure("SCAN_RATE_LIMITED","Scan limit reached. Try again later.",429);const cfg=env();const scan=await db.repositoryScan.create({data:{publicId:nanoid(24),sessionHash:identity.hash,normalizedUrl:repo.normalizedUrl,owner:repo.owner,repository:repo.repository,requestedRef:repo.requestedRef,analysisModel:cfg.AI_ANALYSIS_MODEL,verifierModel:cfg.AI_VERIFIER_MODEL}});const response=NextResponse.json({id:scan.publicId},{status:202});if(identity.isNew)response.headers.set("Set-Cookie",setSessionCookie(identity.raw));return response;
+ }catch(error){if(error instanceof z.ZodError){const variables=[...new Set(error.issues.map(issue=>String(issue.path[0])).filter(Boolean))];console.error("Invalid server configuration:",variables.join(", "));return failure("SERVER_CONFIG_INVALID","The server configuration is incomplete or invalid.",503,{variables})}console.error("Failed to create scan:",error instanceof Error?error.name:"Unknown error");return failure("INTERNAL_ERROR","Could not start the scan because the server encountered an unexpected error.",500)}}

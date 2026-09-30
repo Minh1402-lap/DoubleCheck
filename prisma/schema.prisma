@@ -10,6 +10,10 @@ datasource db {
 enum ScanStatus {
   queued
   collecting
+  static_analyzing
+  static_complete
+  ai_queued
+  ai_analyzing
   mapping
   analyzing
   correlating
@@ -55,6 +59,14 @@ model RepositoryScan {
   verifierModel     String
   usageJson         Json?
   budgetJson        Json?
+  staticRulesetVersion String @default("2026-09-30.v1")
+  staticReportJson  Json?
+  staticCompletedAt DateTime?
+  aiReportJson      Json?
+  aiFailureCode     String?
+  aiFailureMessage  String?
+  aiRequestedAt     DateTime?
+  aiCompletedAt     DateTime?
   failureCode       String?
   failureMessage    String?
   cancelRequestedAt DateTime?
