@@ -7,16 +7,16 @@ import { verifyEvidence } from "../evidence";
 import { computeDecision } from "../policy";
 import type { Chain, CoverageGate, NormalizedObservation } from "../types";
 import { STATIC_DISCLAIMER } from "../types";
-import { OpenAiProvider, type AiProvider } from "./provider";
-import { dailyBudgetStatus, scanUsageSummary } from "./usage";
+import { AiStageError, OpenAiProvider, type AiProvider } from "./provider";
+import { dailyBudgetStatus, scanUsageSummary, settleOutstandingScanReservations } from "./usage";
 import { envelope, prompts } from "./prompts";
 import { challengeSchema, correlationSchema, fileAnalysisSchema, intentSchema, judgeSchema, mapSchema, verifierSchema } from "./schemas";
+import {fileAnalysisPayloads,mapAnalysisPayload} from "./chunking";
 
 async function progress(id: string, status: "collecting"|"mapping"|"analyzing"|"correlating"|"judging"|"verifying"|"challenging", percent: number, message: string) {
   await db.repositoryScan.update({ where: { id }, data: { status, progress: percent, progressMessage: message } });
 }
 
-function batch<T>(items: T[], size: number): T[][] { const out: T[][] = []; for (let i=0;i<items.length;i+=size) out.push(items.slice(i,i+size)); return out; }
 function json(value: unknown): Prisma.InputJsonValue { return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue; }
 
 export function scanFailureDetails(error: unknown) {
@@ -24,6 +24,10 @@ export function scanFailureDetails(error: unknown) {
   if (message === "CANCELLED") return { status: "cancelled" as const, progressMessage: "Scan cancelled", failureCode: "CANCELLED", failureMessage: "CANCELLED", budgetExceeded: false };
   if (message === "AI_DAILY_BUDGET_EXCEEDED") return { status: "failed" as const, progressMessage: "Daily AI budget reached", failureCode: "AI_DAILY_BUDGET_EXCEEDED", failureMessage: "The configured daily AI spending limit has been reached. Try again after 00:00 UTC.", budgetExceeded: true };
   if (message === "AI_SCAN_BUDGET_EXCEEDED") return { status: "failed" as const, progressMessage: "Per-scan AI budget reached", failureCode: "AI_SCAN_BUDGET_EXCEEDED", failureMessage: "Optional AI analysis stopped before exceeding the configured per-scan cost limit.", budgetExceeded: true };
+  if(error instanceof AiStageError){
+    const messages={AI_SCHEMA_CONFIGURATION:"The AI request schema is incompatible with structured output.",AI_INPUT_LIMIT_EXCEEDED:"The AI request exceeded the configured per-request input limit.",AI_PROVIDER_ERROR:error.httpStatus?`The AI provider rejected the request (HTTP ${error.httpStatus}).`:"The AI provider request failed.",AI_RESPONSE_TIMEOUT:"The AI provider request timed out.",AI_RESPONSE_INCOMPLETE:"The AI provider response reached its output limit before structured output completed.",AI_USAGE_MISSING:"The AI provider response did not include usage data.",AI_SCHEMA_PARSE_FAILED:"The AI provider response did not match the expected structured output.",AI_USAGE_PERSISTENCE_FAILED:"AI usage accounting could not be persisted safely."};
+    return {status:"failed" as const,progressMessage:"Optional AI analysis failed safely",failureCode:error.code,failureMessage:messages[error.code],budgetExceeded:false};
+  }
   const providerStatus=typeof error==="object"&&error!==null&&"status" in error&&typeof error.status==="number"?error.status:undefined;
   if(providerStatus){const detail=message.replace(/sk-[A-Za-z0-9_-]+/g,"[redacted]").slice(0,400);return {status:"failed" as const,progressMessage:"AI provider request failed",failureCode:"AI_PROVIDER_ERROR",failureMessage:`The AI provider rejected the request (HTTP ${providerStatus}). ${detail}`,budgetExceeded:false};}
   if (error instanceof GitHubApiError) {
@@ -49,6 +53,7 @@ export async function processScan(scanId: string, provider?: AiProvider) {
   try {
     if (!scan.staticReportJson || !scan.commitSha) throw new Error("STATIC_REPORT_REQUIRED");
     await db.repositoryScan.update({ where: { id: scanId }, data: { status:"ai_analyzing", progress: 5, progressMessage:"Optional AI analysis started", aiFailureCode:null, aiFailureMessage:null } });
+    await db.$transaction([db.observation.deleteMany({where:{scanId}}),db.evidenceChain.deleteMany({where:{scanId}}),db.finding.deleteMany({where:{scanId}}),db.scanDecision.deleteMany({where:{scanId}})]);
     const records=await db.fileRecord.findMany({where:{scanId}}); const snap=await db.repositorySnapshot.findUniqueOrThrow({where:{scanId}});
     type AiCollected={defaultBranch:string|null;sha:string;repository:unknown;owner:unknown;coverage:{inventoryCount:number;inventoryBytes:number;selectedBytes:number;inventoryTruncated:boolean};unclassified:string[];files:Array<{path:string;size:number;type:string;selected:boolean;priorityReasons:string[];skipReason:string|null;content:string|null;hash:string|null}>};
     const collected:AiCollected={defaultBranch:scan.defaultBranch,sha:scan.commitSha,repository:snap.repositoryJson,owner:snap.ownerJson,coverage:snap.coverageJson as AiCollected["coverage"],unclassified:[],files:records.map(f=>({path:f.path,size:f.size,type:f.typeGuess,selected:f.selected,priorityReasons:Array.isArray(f.priorityReasons)?f.priorityReasons.filter((x):x is string=>typeof x==="string"):[],skipReason:f.skipReason,content:f.content,hash:f.contentHash}))};
@@ -59,17 +64,19 @@ export async function processScan(scanId: string, provider?: AiProvider) {
     await db.repositorySnapshot.update({ where: { scanId }, data: { commandsJson: json(commands) } });
 
     await progress(scanId, "mapping", 22, "Mapping project intent and execution instructions");
-    const map = await ai.structured({ stage: "map", system: prompts.map, model: cfg.AI_ANALYSIS_MODEL, schema: mapSchema, data: envelope({ metadata: collected.repository, inventory: collected.files.map(({path,size,type,selected,priorityReasons}) => ({path,size,type,selected,priorityReasons})), documentation: [...fileMap].filter(([p]) => /readme|\.md$/i.test(p)).slice(0,20) }) });
+    const mapData=mapAnalysisPayload(collected.repository,collected.files.map(({path,size,type,selected,priorityReasons})=>({path,size,type,selected,priorityReasons})),[...fileMap].filter(([p])=>/readme|\.md$/i.test(p)).slice(0,20),prompts.map,cfg.AI_MAX_INPUT_TOKENS_PER_REQUEST);
+    const map = await ai.structured({ stage: "map", system: prompts.map, model: cfg.AI_ANALYSIS_MODEL, schema: mapSchema, data: mapData });
     await db.repositorySnapshot.update({ where: { scanId }, data: { mapJson: json(map) } });
 
     await progress(scanId, "analyzing", 38, "Reviewing security-relevant files");
     const observations: NormalizedObservation[] = [];
-    for (const group of batch([...fileMap].map(([path, content]) => ({ path, lines: content.split("\n").map((text, i) => ({ number: i + 1, text })) })), 8)) {
-      const result = await ai.structured({ stage: "file", system: prompts.file, model: cfg.AI_ANALYSIS_MODEL, schema: fileAnalysisSchema, data: envelope({ repositoryMap: map, files: group }) });
-      for (const item of result.observations) observations.push({ ...item, sources: item.sources ?? [], transforms: item.transforms ?? [], sinks: item.sinks ?? [], relatedFiles: item.relatedFiles ?? [], resolved: item.resolved ?? false, evidenceValid: verifyEvidence(item, fileMap) });
+    const filePayloads=fileAnalysisPayloads(map,[...fileMap].map(([path,content])=>({path,lines:content.split("\n").map((text,i)=>({number:i+1,text}))})),prompts.file,Math.min(cfg.AI_MAX_INPUT_TOKENS_PER_REQUEST,cfg.AI_FILE_MAX_INPUT_TOKENS_PER_REQUEST));
+    for (const data of filePayloads) {
+      const result = await ai.structured({ stage: "file", system: prompts.file, model: cfg.AI_ANALYSIS_MODEL, schema: fileAnalysisSchema, data });
+      for (const item of result.observations) observations.push({ ...item, trigger:item.trigger??undefined, benignExplanation:item.benignExplanation??undefined, sources: item.sources ?? [], transforms: item.transforms ?? [], sinks: item.sinks ?? [], relatedFiles: item.relatedFiles ?? [], resolved: item.resolved ?? false, evidenceValid: verifyEvidence(item, fileMap) });
     }
     const validObservations = observations.filter((o) => o.evidenceValid);
-    await db.$transaction(validObservations.map((o) => db.observation.create({ data: { scanId, filePath: o.filePath, lineStart: o.lineStart, lineEnd: o.lineEnd, excerpt: o.excerpt, category: o.category, capability: o.capability, basis: o.basis, severity: o.severity, confidence: o.confidence, detailsJson: json(o), evidenceValid: true } })));
+    if(validObservations.length)await db.observation.createMany({data:validObservations.map((o)=>({scanId,filePath:o.filePath,lineStart:o.lineStart,lineEnd:o.lineEnd,excerpt:o.excerpt,category:o.category,capability:o.capability,basis:o.basis,severity:o.severity,confidence:o.confidence,detailsJson:json(o),evidenceValid:true}))});
 
     await progress(scanId, "correlating", 61, "Connecting behavior across files");
     const correlated = await ai.structured({ stage: "correlate", system: prompts.correlate, model: cfg.AI_ANALYSIS_MODEL, schema: correlationSchema, data: envelope({ map, observations: validObservations }) });
@@ -99,16 +106,15 @@ export async function processScan(scanId: string, provider?: AiProvider) {
     const decision = computeDecision({ chains, observations: validObservations, coverage, challenger, judge, promptInjectionFound: validObservations.some((o) => o.category === "prompt_injection_attempt"), trustSignalCount: 0, pressureAndNewOwner: false });
     const usage = await scanUsageSummary(scanId);const budget = await dailyBudgetStatus(false);
     const aiReport=json({version:1,models:{analysis:cfg.AI_ANALYSIS_MODEL,verifier:cfg.AI_VERIFIER_MODEL},map,observations:validObservations,chains,decision,judge,usage});
-    await db.$transaction([
-      ...chains.map((c) => db.evidenceChain.create({ data: { scanId, title: c.title, stepsJson: c.steps, edgesJson: c.edges, impact: correlated.chains.find((x) => x.id === c.id)?.impact ?? "", severity: c.severity, confidence: c.confidence, evidenceValid: c.evidenceValid, verificationResult: c.verifier } })),
-      db.scanDecision.create({ data: { scanId, recommendation: decision.verdict, confidence: decision.confidence, decidedBy: decision.decidedBy, judgeProposal: judge.verdict, judgeConfidence: judge.confidence, judgePolicyAgreement: decision.judgePolicyAgreement, disagreementReason: decision.judgePolicyAgreement ? undefined : "The deterministic safety policy overrode the AI proposal.", primaryReason: decision.reason, decisiveFindingIds: json(judge.decisiveEvidenceIds), commandsJson: json(commands), precautionsJson: ["inspect_automatic_triggers", "use_disposable_environment"], nextStepsJson: json(judge.inspectNext), disclaimer: STATIC_DISCLAIMER, gatesJson: json({ decision, challenger, verifier: chains.map((c) => ({ id: c.id, result: c.verifier })) }) } }),
-      db.repositoryScan.update({ where: { id: scanId }, data: { status: "completed", progress: 100, progressMessage: "Optional AI analysis complete", completeness: partial ? "partial" : "complete", completedAt: new Date(), aiCompletedAt:new Date(), aiReportJson:aiReport, usageJson: json(usage), budgetJson: json(budget) } })
-    ]);
+    const decisionData={recommendation:decision.verdict,confidence:decision.confidence,decidedBy:decision.decidedBy,judgeProposal:judge.verdict,judgeConfidence:judge.confidence,judgePolicyAgreement:decision.judgePolicyAgreement,disagreementReason:decision.judgePolicyAgreement?null:"The deterministic safety policy overrode the AI proposal.",primaryReason:decision.reason,decisiveFindingIds:json(judge.decisiveEvidenceIds),commandsJson:json(commands),precautionsJson:json(["inspect_automatic_triggers","use_disposable_environment"]),nextStepsJson:json(judge.inspectNext),disclaimer:STATIC_DISCLAIMER,gatesJson:json({decision,challenger,verifier:chains.map((c)=>({id:c.id,result:c.verifier}))})};
+    await db.$transaction(async tx=>{await tx.evidenceChain.deleteMany({where:{scanId}});if(chains.length)await tx.evidenceChain.createMany({data:chains.map((c)=>({scanId,title:c.title,stepsJson:json(c.steps),edgesJson:json(c.edges),impact:correlated.chains.find((x)=>x.id===c.id)?.impact??"",severity:c.severity,confidence:c.confidence,evidenceValid:c.evidenceValid,verificationResult:c.verifier}))});await tx.scanDecision.upsert({where:{scanId},create:{scanId,...decisionData},update:decisionData});await tx.repositoryScan.update({where:{id:scanId},data:{status:"completed",progress:100,progressMessage:"Optional AI analysis complete",completeness:partial?"partial":"complete",completedAt:new Date(),aiCompletedAt:new Date(),aiReportJson:aiReport,usageJson:json(usage),budgetJson:json(budget)}});});
   } catch (error) {
+    await settleOutstandingScanReservations(scanId);
     const failure = scanFailureDetails(error);
-    console.error(`[worker] Scan ${scan.publicId} failed: ${failure.failureCode}`);
+    const diagnostic=error instanceof AiStageError?{code:error.code,stage:error.stage,model:error.model,httpStatus:error.httpStatus??null,providerRequestId:error.providerRequestId??null,providerResponseId:error.providerResponseId??null,reasonCode:error.reasonCode}:{code:failure.failureCode};
+    console.error(`[worker] Scan ${scan.publicId} failed: ${JSON.stringify(diagnostic)}`);
     const usage = await scanUsageSummary(scanId);
     const budget = await dailyBudgetStatus(failure.budgetExceeded);
-    await db.repositoryScan.update({ where: { id: scanId }, data: { status: scan.staticReportJson?"static_complete":failure.status, progress:100, progressMessage: scan.staticReportJson?"Static report ready; optional AI failed":failure.progressMessage, aiFailureCode:failure.failureCode, aiFailureMessage:failure.failureMessage, usageJson: json(usage), budgetJson: json(budget), aiCompletedAt:new Date() } });
+    await db.repositoryScan.update({ where: { id: scanId }, data: { status: scan.staticReportJson?"static_complete":failure.status, progress:100, progressMessage: scan.staticReportJson?"Static report ready; optional AI failed":failure.progressMessage, aiFailureCode:failure.failureCode, aiFailureMessage:failure.failureMessage, aiFailureMetadata:json(diagnostic), usageJson: json({...usage,failureDiagnostic:diagnostic}), budgetJson: json(budget), aiCompletedAt:new Date() } });
   }
 }

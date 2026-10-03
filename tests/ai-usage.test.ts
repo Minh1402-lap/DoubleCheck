@@ -18,16 +18,23 @@ describe("AI usage costing", () => {
 
   it("reserves the full output allowance and a conservative input bound", () => {
     const reserved = calculateEstimatedCostMicrousd(pricing, "system", "data");
-    expect(reserved).toBeGreaterThanOrEqual(80_000n);
+    expect(reserved).toBeGreaterThanOrEqual(160_000n);
+  });
+
+  it("uses the configured output ceiling in the reservation estimate",()=>{
+    expect(calculateEstimatedCostMicrousd(pricing,"system","data",8_000)).toBeLessThan(calculateEstimatedCostMicrousd(pricing,"system","data",16_000));
   });
 
   it("aggregates usage and preserves per-stage estimated costs", () => {
     const summary = aggregateAiUsage([
       { stage: "map", model: "model-a", status: "completed", inputTokens: 100, cachedInputTokens: 20, outputTokens: 30, reasoningTokens: 5, totalTokens: 130, reservedMicrousd: 900n, actualMicrousd: 400n },
-      { stage: "judge", model: "model-b", status: "completed", inputTokens: 200, cachedInputTokens: 0, outputTokens: 40, reasoningTokens: 10, totalTokens: 240, reservedMicrousd: 1_100n, actualMicrousd: 600n }
+      { stage: "judge", model: "model-b", status: "completed", inputTokens: 200, cachedInputTokens: 0, outputTokens: 40, reasoningTokens: 10, totalTokens: 240, reservedMicrousd: 1_100n, actualMicrousd: 600n },
+      { stage: "file", model: "model-a", status: "estimated_failure", inputTokens: null, cachedInputTokens: null, outputTokens: null, reasoningTokens: null, totalTokens: null, reservedMicrousd: 700n, actualMicrousd: 700n },
+      { stage: "verify", model: "model-b", status: "reserved", inputTokens: null, cachedInputTokens: null, outputTokens: null, reasoningTokens: null, totalTokens: null, reservedMicrousd: 300n, actualMicrousd: null }
     ]);
-    expect(summary).toMatchObject({ inputTokens: 300, outputTokens: 70, reasoningTokens: 15, totalTokens: 370, estimatedCostMicrousd: "2000", actualCostMicrousd: "1000" });
-    expect(summary.stages[0]).toMatchObject({ stage: "map", model: "model-a", estimatedCostMicrousd: "900", actualCostMicrousd: "400" });
+    expect(summary).toMatchObject({inputTokens:300,outputTokens:70,reasoningTokens:15,totalTokens:370,estimatedCostMicrousd:"3000",reservedCostMicrousd:"300",providerConfirmedActualCostMicrousd:"1000",conservativeEstimatedFailureCostMicrousd:"700",applicationCommittedCostMicrousd:"2000",actualCostMicrousd:"1000"});
+    expect(summary.stages[0]).toMatchObject({stage:"map",model:"model-a",estimatedCostMicrousd:"900",providerConfirmedActualCostMicrousd:"400",conservativeEstimatedFailureCostMicrousd:"0",actualCostMicrousd:"400"});
+    expect(summary.stages[2]).toMatchObject({status:"estimated_failure",providerConfirmedActualCostMicrousd:"0",conservativeEstimatedFailureCostMicrousd:"700",actualCostMicrousd:null});
   });
 
   it("maps budget rejection to a stable safe scan failure", () => {

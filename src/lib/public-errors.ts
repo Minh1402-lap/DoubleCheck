@@ -1,0 +1,2 @@
+const SAFE_CODES=new Set(["GITHUB_TOKEN_MISSING","GITHUB_TOKEN_INVALID","GITHUB_PERMISSION_DENIED","GITHUB_PRIMARY_RATE_LIMIT","GITHUB_SECONDARY_RATE_LIMIT","GITHUB_REPOSITORY_NOT_FOUND","GITHUB_PRIVATE_REPOSITORY","AI_DAILY_BUDGET_EXCEEDED","AI_SCAN_BUDGET_EXCEEDED","CANCELLED"]);
+export function publicScanFailure(code:unknown,message:unknown){return typeof code==="string"&&SAFE_CODES.has(code)&&typeof message==="string"?message:"The scan stopped safely before a report could be completed. No repository code was executed."}

@@ -1,6 +1,7 @@
 import type { EvidenceRef } from "@/lib/types";
 import { DeleteReport } from "@/components/DeleteReport";
 import Link from "next/link";
+import {formatCompactBytes,formatDateTimeUtc} from "@/lib/format";
 
 export type ReportData = {
   id?: string;
@@ -26,7 +27,7 @@ export type ReportData = {
   agreement: boolean;
 };
 
-const bytes = (n: number) => new Intl.NumberFormat("en", { notation: "compact", style: "unit", unit: "byte", unitDisplay: "narrow" }).format(n);
+const bytes = formatCompactBytes;
 
 export function ReportView({ report }: { report: ReportData }) {
   return <main className="report">
@@ -35,7 +36,7 @@ export function ReportView({ report }: { report: ReportData }) {
         {report.demo && <div className="demoFlag">Sanitized demo fixture</div>}
         <p className="muted">Repository analysis</p>
         <h1 className="repoTitle">{report.owner}/{report.repository}</h1>
-        <p className="muted">Analyzed {new Date(report.date).toLocaleString()} · commit <a className="textLink" href={`${report.url}/commit/${report.sha}`}>{report.sha}</a></p>
+        <p className="muted">Analyzed {formatDateTimeUtc(report.date)} UTC · commit <a className="textLink" href={`${report.url}/commit/${report.sha}`}>{report.sha}</a></p>
       </div>
       <span className={`badge ${report.verdict}`}>{report.verdict} · {report.confidence} confidence</span>
     </div>

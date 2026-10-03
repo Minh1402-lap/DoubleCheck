@@ -1,131 +1,166 @@
 # DoubleCheck
 
-DoubleCheck is a pre-execution trust analyzer for unfamiliar public GitHub repositories. It fetches a bounded snapshot at an immutable commit, treats repository content as untrusted data, and produces an evidence-linked **Run / Review / Avoid** recommendation without cloning, installing, importing, building, testing, or executing the target repository.
+DoubleCheck helps you inspect an unfamiliar public GitHub repository before deciding whether to run it. It downloads a bounded, immutable snapshot through the GitHub API, analyzes the files as untrusted data, and produces an evidence-linked **Run / Review / Avoid** recommendation.
 
-The default product is static-first: a useful deterministic report completes without an OpenAI key. AI analysis is an optional, separately requested supplement with explicit per-scan and daily cost ceilings.
+DoubleCheck does **not** clone, install, import, build, test, or execute code from the repository being reviewed.
+
+Version 1 is a static-only product. It does not call OpenAI or any other AI provider. AI-assisted analysis is reserved for a separately reviewed version 2.
+
+## What version 1 provides
+
+- Strict validation for canonical public GitHub repository URLs.
+- Authenticated GitHub API collection with useful authentication and rate-limit errors.
+- Immutable commit pinning so every report refers to an exact repository state.
+- Bounded file inventory and content collection with explicit skip reasons.
+- Language-aware deterministic security rules with exact file and line evidence.
+- Reduced-confidence disclosures for generated, vendor, and minified content.
+- Deterministic risk scoring and a Run / Review / Avoid recommendation.
+- Session-owned report pages with redacted JSON and Markdown exports.
+- A separate worker with atomic job claiming, leases, heartbeats, and safe restart behavior.
+- JSON API errors, CSP/security headers, secret redaction, and `noindex` report pages.
+
+Static analysis cannot prove that a repository is safe. The report is decision support, not a guarantee.
 
 ## Architecture
 
 ```text
-browser -> Next.js web/API -> PostgreSQL queue -> worker
-                                                |-> GitHub metadata, commit, tree, blobs
-                                                |-> deterministic static rules
-                                                `-> static_complete report + export
+Browser
+   |
+   v
+Next.js web/API -----> PostgreSQL queue and report storage
+                              |
+                              v
+                           Worker
+                              |
+                              +-- GitHub metadata, commit, tree, and blobs
+                              +-- deterministic static rules
+                              `-- static report and export
 
-static_complete -> explicit AI request -> budget reservation -> optional AI supplement
+queued -> collecting -> static_analyzing -> static_complete
 ```
 
-The web process validates requests and owns reports through an anonymous HttpOnly session. The worker collects only from GitHub's fixed API origin, pins the resolved commit SHA, enforces file and byte limits, stores selected text as inert data, and runs a versioned static ruleset. Optional AI failure is recorded separately and does not destroy the static report.
+The web process validates requests and owns reports through an anonymous HttpOnly session. The worker communicates with the fixed GitHub API origin, pins the resolved commit SHA, applies count and byte limits, stores selected text as inert data, and runs a versioned static ruleset.
 
-## Features
+With `AI_FEATURE_MODE=disabled`, the report UI contains no AI controls, the AI endpoint returns `AI_DISABLED`, and the worker never claims AI jobs.
 
-- Strict public GitHub repository URL validation and authenticated GitHub API collection.
-- Immutable commit pinning, bounded inventory/content collection, and explicit skipped-file reasons.
-- Language-aware static rules with file/line evidence, deterministic scoring, and disclosure for generated, vendor, or minified files.
-- Private session-owned report pages plus redacted JSON and Markdown exports.
-- Static-only operation when AI is disabled or unavailable.
-- Explicit opt-in AI mode with model pricing validation, per-scan limits, UTC-day limits, reservation/reconciliation accounting, and per-stage token/cost records.
-- Safe JSON API errors, progress states, GitHub authentication/rate-limit diagnostics, CSP and other security headers.
+## Requirements
 
-## Local setup
+- Node.js 22 or newer
+- npm
+- Docker Desktop
+- PostgreSQL 16
+- A GitHub token that can read public repository metadata and contents
 
-Requirements: Node.js 22 or newer, npm, Docker Desktop, and PostgreSQL 16. A GitHub token is required for repository scans; OpenAI configuration is optional.
+No OpenAI key is required for version 1.
 
-1. Start PostgreSQL 16. The example uses placeholders intentionally—choose a local password and use the same value in `DATABASE_URL`.
+## Local setup on Windows
 
-   ```powershell
-   docker run --name doublecheck-postgres `
-     -e POSTGRES_USER=postgres `
-     -e POSTGRES_PASSWORD=<strong-local-password> `
-     -e POSTGRES_DB=doublecheck `
-     -p 5432:5432 `
-     -d postgres:16
+### 1. Start PostgreSQL 16
 
-   docker exec doublecheck-postgres pg_isready -U postgres -d doublecheck
-   docker exec doublecheck-postgres psql -U postgres -d doublecheck -c "select current_database();"
-   ```
+Choose a local password and use the same value later in `DATABASE_URL`.
 
-   On later runs, use `docker start doublecheck-postgres`. Do not create a second container if port 5432 already belongs to an existing database.
+```powershell
+docker run --name doublecheck-postgres `
+  -e POSTGRES_USER=postgres `
+  -e POSTGRES_PASSWORD=<strong-local-password> `
+  -e POSTGRES_DB=doublecheck `
+  -p 5432:5432 `
+  -d postgres:16
+```
 
-2. Install dependencies and create the local configuration.
+Wait until PostgreSQL is ready and verify the database from inside the container:
 
-   ```powershell
-   npm install
-   Copy-Item .env.example .env
-   ```
+```powershell
+docker exec doublecheck-postgres pg_isready -U postgres -d doublecheck
+docker exec doublecheck-postgres psql -U postgres -d doublecheck -c "select current_database();"
+```
 
-3. Edit `.env`, then generate Prisma Client and apply the checked-in migrations.
+For later sessions, reuse the same container:
 
-   ```powershell
-   npm run db:generate
-   npx prisma migrate deploy
-   npx prisma migrate status
-   ```
+```powershell
+docker start doublecheck-postgres
+```
 
-4. Run the web app and worker in separate terminals from the project directory.
+Do not create another container if port `5432` is already used. Inspect the existing process or container first.
 
-   ```powershell
-   # Terminal 1
-   npm run dev
-   ```
+### 2. Install dependencies and create `.env`
 
-   ```powershell
-   # Terminal 2
-   npm run worker
-   ```
+```powershell
+npm install
+Copy-Item .env.example .env
+```
 
-Open `http://localhost:3000`. The `/demo` page contains sanitized sample data; the normal scan path is never mocked.
+Fill in the required values without committing `.env`:
+
+```ini
+DATABASE_URL="postgresql://postgres:<strong-local-password>@localhost:5432/doublecheck"
+GITHUB_TOKEN="<your-token>"
+SESSION_SECRET="<random-value-of-at-least-32-characters>"
+AI_FEATURE_MODE="disabled"
+```
+
+Do not paste tokens into logs, issues, screenshots, or chat messages.
+
+### 3. Generate Prisma Client and apply migrations
+
+```powershell
+npm run db:generate
+npx prisma migrate deploy
+npx prisma migrate status
+```
+
+Use the development migration command only when intentionally changing the schema:
+
+```powershell
+npm run db:migrate -- --name <migration-name>
+```
+
+### 4. Run web and worker in separate terminals
+
+Terminal 1:
+
+```powershell
+npm run dev
+```
+
+Terminal 2:
+
+```powershell
+npm run worker
+```
+
+Open [http://localhost:3000](http://localhost:3000). The `/demo` route uses sanitized sample data; the normal scan route is never mocked.
 
 ## Environment variables
 
-Never commit `.env`. Keep credentials server-side and use secret storage outside local development.
-
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `DATABASE_URL` | Yes | PostgreSQL URL, for example `postgresql://postgres:<password>@localhost:5432/doublecheck` |
-| `GITHUB_TOKEN` | For scans | GitHub token with read access to public repository metadata and contents |
-| `SESSION_SECRET` | Yes | Random value of at least 32 characters used to HMAC anonymous ownership sessions |
+| `DATABASE_URL` | Yes | PostgreSQL connection URL |
+| `GITHUB_TOKEN` | For live scans | Server-side GitHub credential with read access to public metadata and contents |
+| `SESSION_SECRET` | Yes | Random value of at least 32 characters used to protect anonymous ownership sessions |
+| `AI_FEATURE_MODE` | Yes for v1 | Must remain `disabled` |
 | `APP_BASE_URL` | No | Canonical origin; defaults to `http://localhost:3000` |
-| `DEMO_MODE` | No | Explicit `true` or `false`; does not change the live scan path |
-| `RAW_RETENTION_HOURS` | No | Raw-content retention window; defaults to 24 |
-| `REPORT_RETENTION_DAYS` | No | Report retention window; defaults to 30 |
-| `AI_FEATURE_MODE` | No | `disabled` (default), `local`, or future authenticated `server` mode |
-| `OPENAI_API_KEY` | AI only | Server-side OpenAI credential |
-| `AI_ANALYSIS_MODEL` | AI only | Explicit analysis model ID |
-| `AI_VERIFIER_MODEL` | AI only | Explicit verifier/challenger model ID |
-| `AI_MODEL_PRICING_JSON` | AI only | Model map containing USD-per-million `input`, `cachedInput`, and `output` prices |
-| `AI_MAX_COST_PER_SCAN_USD` | AI only | Maximum reserved/actual AI cost for one scan |
-| `AI_DAILY_BUDGET_USD` | AI only | Global UTC-day AI ceiling |
+| `DEMO_MODE` | No | Enables explicit demo behavior when set to `true`; it does not replace the live scan path |
+| `RAW_RETENTION_HOURS` | No | Selected raw-content retention window; defaults to 24 hours |
+| `REPORT_RETENTION_DAYS` | No | Completed-report retention window; defaults to 30 days |
 
-The checked-in `.env.example` contains non-secret development defaults. Pricing uses this shape:
-
-```json
-{
-  "gpt-5.6-terra": { "input": 2, "cachedInput": 0.2, "output": 12 },
-  "gpt-5-mini": { "input": 0.25, "cachedInput": 0.025, "output": 2 }
-}
-```
-
-Every configured analysis and verifier model must resolve to an entry. Prices are USD per one million tokens; verify them against current provider pricing before enabling AI.
-
-### Optional AI and cost controls
-
-`AI_FEATURE_MODE=disabled` keeps the entire scan static. In development, `local` enables an explicit AI action after `static_complete`; it also requires the OpenAI key, both model IDs, valid pricing, and positive scan/day budgets. `server` is intentionally rejected until real application authentication exists.
-
-Before each provider request, DoubleCheck atomically reserves a conservative maximum cost against both ceilings. Successful responses reconcile the reservation with provider-reported token counts. A dispatched request with an ambiguous failure retains its reservation as estimated spend because it may have been billed.
+`.env.example` contains placeholders and safe defaults only. Never commit `.env`, database dumps, logs, tokens, API keys, or session secrets.
 
 ## Security boundaries
 
-- Only canonical `https://github.com/{owner}/{repo}` URLs are accepted; arbitrary hosts, embedded credentials, custom ports, file links, and non-HTTPS schemes are rejected.
-- Repository files are data only. DoubleCheck never runs target code or package-manager commands and never follows repository-supplied URLs.
-- Collection uses a fixed GitHub API origin, commit pinning, content classification, and count/byte limits.
-- Reports and mutations require the owning session; exports redact secret-shaped values and pages are marked `noindex`.
-- AI receives bounded, explicitly delimited untrusted data. Structured output is schema-validated and evidence must match stored file ranges.
-- Deterministic policy owns the recommendation. A result is decision support, not a guarantee that a repository is safe.
+- Only canonical `https://github.com/{owner}/{repository}` URLs are accepted.
+- Arbitrary hosts, embedded credentials, custom ports, file URLs, and non-HTTPS schemes are rejected.
+- Repository text, documentation, filenames, and comments are untrusted data—not instructions.
+- Target repository code and package-manager commands are never executed.
+- Collection uses a fixed GitHub API origin, immutable commit pinning, content classification, and count/byte limits.
+- Reports and mutations require the owning anonymous session.
+- Exports redact secret-shaped values and report pages are marked `noindex`.
+- Static recommendations are deterministic; repository content cannot instruct the analyzer to change its policy.
+- The application must not receive a Docker socket or a host home-directory mount.
 
 ## Verification
 
-Run the release checks with:
+Run the release checks from the project directory:
 
 ```powershell
 npm test
@@ -135,27 +170,52 @@ npm run build
 git diff --check
 ```
 
-The first-release candidate was exercised end to end against a public repository with AI disabled: PostgreSQL migrations applied, GitHub metadata and 95 file records collected, 67 contents selected, a deterministic report and both exports produced, and zero AI jobs, provider calls, usage records, or AI cost recorded. Automated unit/regression totals are reported from the current run rather than treated as a permanent claim in this document.
+The current version 1 regression suite contains 104 passing tests. The static-first flow has also been exercised end to end against a public repository: PostgreSQL migrations applied, GitHub metadata and 95 file records collected, 67 file contents selected, a deterministic report and both exports produced, with zero AI jobs, provider calls, usage records, or AI cost.
 
-## Known limitations
-
-- Static rules are conservative heuristics. Runtime-generated behavior, binaries, encrypted or split payloads, transitive dependency behavior, and environment-specific execution can be missed.
-- A grouped configuration finding preserves its full line range, but it does not prove whether referenced credentials are sensitive, present, or later exfiltrated.
-- Generated/vendor/minified static data without executable-language signals skips execution rules; executable generated content is analyzed with reduced confidence and disclosed in the report.
-- Only public GitHub repositories are supported. Blob retrieval is sequential and large repositories may hit bounded collection limits.
-- The worker lacks a production-grade atomic lease, heartbeat, retry counter, and multi-worker recovery protocol.
-- Rate limiting is process-local, and retention deadlines exist without a bundled scheduler.
-- Dependency advisory/provenance coverage, broad benign-corpus benchmarking, and live AI quality/cost benchmarking are incomplete.
-- Authenticated multi-user AI mode, encrypted BYOK storage, public sharing, appeals, and a retry/rescan endpoint are not implemented.
-
-More detail is available in [architecture](docs/ARCHITECTURE.md), [threat model](docs/THREAT_MODEL.md), [limitations](docs/LIMITATIONS.md), and [benchmark status](docs/BENCHMARK.md).
-
-## Other commands
+Optional browser tests are available with:
 
 ```powershell
 npm run test:e2e
-npm run start
-npm run db:migrate -- --name <migration-name>  # development schema changes only
 ```
 
-For production-like startup, build first and run the web and worker as separate non-root processes. Do not mount the Docker socket or a host home directory into either process; restrict worker egress to GitHub, PostgreSQL, and the explicitly configured AI provider.
+## Production-like startup
+
+Build first, then run the web process and worker as separate non-root processes:
+
+```powershell
+npm run build
+```
+
+Terminal 1:
+
+```powershell
+npm run start
+```
+
+Terminal 2:
+
+```powershell
+npm run worker
+```
+
+Restrict worker egress to GitHub and PostgreSQL. Keep `AI_FEATURE_MODE=disabled` for the version 1 release.
+
+## Known limitations
+
+- Only public GitHub repositories are supported.
+- Static rules are conservative heuristics and can produce false positives or miss behavior generated only at runtime.
+- Binaries, encrypted or split payloads, environment-specific behavior, and transitive dependency behavior are not fully observable.
+- Large repositories can reach bounded inventory, byte, or GitHub API limits.
+- Generated, vendor, and minified files may be skipped for execution rules or analyzed with reduced confidence; the report discloses this.
+- Credential-configuration blocks preserve evidence but cannot prove that referenced secrets exist or are later exfiltrated.
+- GitHub request throttling is process-local.
+- The worker has leases and stale-job recovery but no dead-letter queue or maximum-attempt policy yet.
+- Retention deadlines are stored, but no bundled external scheduler is provided.
+- Dependency advisory and provenance analysis are not comprehensive.
+- Public report sharing, accounts, teams, appeals, and a retry/rescan endpoint are not implemented.
+
+More detail is available in [architecture](docs/ARCHITECTURE.md), [threat model](docs/THREAT_MODEL.md), [limitations](docs/LIMITATIONS.md), and [benchmark status](docs/BENCHMARK.md).
+
+## Version 2 roadmap
+
+The repository retains experimental AI pipeline code, but it is not part of the version 1 product surface. Re-enabling it requires a separate review covering authentication, checkpointed retries, quality benchmarks, provider failure handling, cost accounting, privacy, and production operations. Do not enable it by changing only an environment variable.

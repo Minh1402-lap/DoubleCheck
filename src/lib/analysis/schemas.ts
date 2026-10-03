@@ -20,12 +20,12 @@ export const mapSchema = z.object({
 export const observationSchema = evidenceObject.extend({
   id: z.string().min(1).max(100), category: z.string().min(1).max(100),
   capability: z.string().min(1).max(1000), basis: z.enum(["observed", "inferred", "unknown"]),
-  severity: z.enum(severities), confidence: z.enum(confidences), trigger: z.string().max(1000).optional(),
+  severity: z.enum(severities), confidence: z.enum(confidences), trigger: z.string().max(1000).nullable(),
   sources: z.array(z.string().max(500)).max(30).default([]), transforms: z.array(z.string().max(500)).max(30).default([]),
   sinks: z.array(z.string().max(500)).max(30).default([]), relatedFiles: z.array(z.string().max(500)).max(30).default([]),
-  benignExplanation: z.string().max(2000).optional(), resolved: z.boolean().default(false)
+  benignExplanation: z.string().max(2000).nullable(), resolved: z.boolean().default(false)
 });
-export const fileAnalysisSchema = z.object({ observations: z.array(observationSchema).max(100), requestedFiles: z.array(z.string()).max(30) });
+export const fileAnalysisSchema = z.object({ observations: z.array(observationSchema).max(12), requestedFiles: z.array(z.string()).max(30) });
 
 export const chainSchema = z.object({
   id: z.string(), title: z.string(), severity: z.enum(severities), confidence: z.enum(confidences),
